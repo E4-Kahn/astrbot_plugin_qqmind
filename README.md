@@ -1,6 +1,7 @@
 # Token消耗高级优化（QQ机器人套件）· astrbot_plugin_qqmind
 
-> 作者：**本少** (DanDingBenShao) · B站教程/演示：[本少-淡定版](https://space.bilibili.com/411821291)
+> 原作者：**本少** (DanDingBenShao) · B站教程/演示：[本少-淡定版](https://space.bilibili.com/411821291)
+> 现维护：**本人的鱼** (E4-Kahn) · 本仓库：[E4-Kahn/astrbot_plugin_qqmind](https://github.com/E4-Kahn/astrbot_plugin_qqmind)
 
 为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 装上一套可配置的群聊记忆管线：**浅层判读门省 token，深层记忆可寻回**。
 
@@ -42,6 +43,71 @@
 - **审查修复**（v0.3.5）：主动私信 NameError 修复（护栏真正生效：24h 未回应计数→冷却 7 天）、攒批/随机读判读补群名片锚点、历史导入 token 记账、池压缩账单改用真实 usage（去掉恒定虚增 4000）、非空文本 token 估算至少记 1、群缓冲单条超长截断、控制台 XSS 防御加固；下架两个无效配置项（`history_rounds`/`history_dir`）
 - **判读瘦身**（v0.3.5）：判读不再带 7 条群聊语境（账单实测语境占判读输入 ~40% 且群越活跃缓存越难命中；98.6% 的判读结论是「否」），只判待判消息本身+群名片锚点，单次判读成本降约六成；回复路径语境不受影响
 
+## v0.4.0 改了什么（相对上游 v0.3.9）
+
+这一版**只动记忆**：判读门、四档套餐、人设、护栏、主动私信、账单逻辑都保持原样，行为不变。
+
+### 1. 私聊与群聊合并成一条记忆线
+
+上游的私聊窗口（`diaries_dir/<uid>.db` 的 window）、群聊窗口（`group_memory_dir/<gid>.json` 的 flat/precise）和群日记（`group_diaries_dir/group_public.db`）是三套互不相通的存储。现在统一成 `diaries_dir/memory.db`，窗口、日记、画像、好感度全住在一个文件里：
+
+- 每条消息带来源标记 `src`（`private`/`group`）与 `gid`/`uid`/`nick`，写日记时**一起压**，不再为私聊和群聊各调一次模型
+- 读的时候按场景切片：`context(scope="private")` 只取私聊，`context(scope="group")` 只取本群
+- 私聊里能看到「群里最近在聊」（新增 `private_group_glance_msgs`，默认 6 条，填 0 关闭）；群里也能接上一个话题的尾巴
+- 隐私边界：含私聊内容的篇目 `gid=0`，群聊侧**只给概要、不给原话**，`/群日记 #编号` 同样只回概要
+
+### 2. 压缩不再把窗口堵死
+
+上游「失败绝不丢原文」的实现方式是原文留在窗口里等重试。模型一抽风（返回散文、截断 JSON、API 抖动），窗口就只涨不消，token 越烧越多。现在把「移出窗口」和「生成摘要」拆成两步：
+
+- `evict_oldest()` 先纯本地把最老一段移出窗口，同时落一条**摘录条目**——零成本，summary 取原文前 200 字，`content` 留前 3000 字，所以原文其实没丢
+- `summarize()` 再让模型把它升级成正式日记；模型没给原文时沿用摘录里的原文
+- 连续失败 3 次熔断 30 分钟，期间只走本地摘录，**窗口照样缩小**
+- 每轮顺带补升级 1~2 条历史摘录条目，欠的账慢慢还
+- 结果：窗口 token 单调下降，与模型可用性完全解耦
+
+### 3. 输出解析加了降级链
+
+`json.loads → 剥代码围栏 → 截断括号修补 → 逐字段正则 → 散文兜底`。顺带修掉 `text_chat` 分支**没传 `max_tokens`** 的老 bug（参数被静默忽略，模型按默认值输出，长日记容易被腰斩）。
+
+### 4. 顺带修的串号问题
+
+合并后所有会话共用一个库，原来写死单键的元数据会互相覆盖：
+
+- 好感度 `affection` → `affinity:<uid>`
+- 用户画像 `profile` → `profile:<uid>`
+- 私聊注入链路里 `p.uid` 恒为 0 导致「读到别人的好感度」，一并修了
+
+### 5. 数据迁移
+
+首次启动自动合并，幂等可重入：`<uid>.db`、`group_public.db`、`<gid>.db` 并进 `memory.db`，窗口消息补 `src`/`uid`，画像与好感度转成新键，原文件改名 `.migrated` 留作备份。
+
+> **升级前建议手动备份一份 `data/plugin_data/astrbot_plugin_qqmind/`。** 迁移失败不影响启动，只在日志里留 warning。
+
+### 行为变化
+
+- `precise_memory` 开关保留，但等价于平铺窗口（精确记忆线并入公共时间线）
+- `group_memory_dir` 里的 `flat`/`precise` 不再写入，该目录只留给候选池合批使用
+
+<details>
+<summary>改动文件清单（相对上游共 12 个文件）</summary>
+
+| 文件 | 改了什么 |
+|---|---|
+| `core/private.py` | 重写为 `MemorySession`：统一窗口 + 来源切片 + 四层压缩 + 解析降级链（`PrivateSession` 保留为别名） |
+| `core/diary.py` | 加 `scope` 过滤、`update()`、`merge_db()`、`meta_keys()`、`entry_content()`、画像分键 |
+| `main.py` | 加 `_memory_store()`/`_session()`/`_migrate_memory_dbs()`/`_pool_evict_handler()`/`_compress_memory()`；`_record_incoming`/`_persist_group` 改为写统一窗口；删 `_compress_or_restore()` |
+| `handlers/memory_inject.py` | 私聊 prompt 加群聊速览、压缩改走 `ensure_budget()`、回捞按 `scope` 检索、群聊展开只给概要 |
+| `handlers/interactions.py` | 主动私信按 `uid + src` 过滤窗口，不再读全库消息 |
+| `handlers/commands.py` | `/日记`、`/群日记` 加 `scope`，群聊展开禁私聊原文 |
+| `core/affection.py` | 好感度改 `affinity:<uid>`，兼容旧单键并自动迁移 |
+| `core/proactive.py` | `memory_digest()` 加 `scope`，主动私信只读私聊记忆 |
+| `webapi/__init__.py` | `/stats`、`/diaries`、`/sessions` 适配统一库与新键 |
+| `_conf_schema.json` | 新增 `private_group_glance_msgs`，改 `private_budget_tokens` / `diaries_dir` 说明 |
+| `README.md` / `metadata.yaml` | 作者、仓库地址、版本号与本文说明 |
+
+</details>
+
 ## 护栏
 
 每日 token 预算熔断（烧完自动降级只@）· 每群回复频率上限（兼 QQ 风控保护）· @全体忽略 · bot 互怼拦截 · 判读连续失败自动降级轻量 · 主动私信多重护栏（白名单/每日上限/冷却/时段限制）
@@ -51,7 +117,7 @@
 在 AstrBot WebUI 的插件市场搜索 `qqmind`，或直接从仓库安装：
 
 ```
-https://github.com/DanDingBenShao/astrbot_plugin_qqmind
+https://github.com/E4-Kahn/astrbot_plugin_qqmind
 ```
 
 零第三方依赖（纯 Python 标准库 + astrbot.api），装上即可用。
