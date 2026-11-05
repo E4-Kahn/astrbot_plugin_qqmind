@@ -86,20 +86,42 @@ class AffectionStore:
             self._day = today
             self._gained = {}
 
+    @staticmethod
+    def _key(uid: int) -> str:
+        """v0.4.0：一个库装所有人，好感度按 uid 分键（旧单键会串号）。"""
+        return f"affinity:{int(uid)}"
+
     def get(self, uid: int) -> dict:
-        raw = self._diary(uid)._meta_get("affection")
+        d = self._diary(uid)
+        raw = d._meta_get(self._key(uid))
         if not raw:
-            d = dict(DEFAULT)
-            d["score"] = self.base
-            return d
+            # 旧库兼容：单用户库里的单键 affection（合并时已由 merge_db 搬好）
+            legacy = d._meta_get("affection")
+            if legacy:
+                try:
+                    _meta_set = d._meta_set
+                except AttributeError:
+                    _meta_set = None
+                if _meta_set:
+                    try:
+                        _meta_set(self._key(uid), legacy)
+                        if hasattr(d, "del_meta"):
+                            d.del_meta("affection")
+                        raw = legacy
+                    except Exception:      # noqa: BLE001
+                        raw = legacy
+        if not raw:
+            d0 = dict(DEFAULT)
+            d0["score"] = self.base
+            return d0
         try:
-            d = json.loads(raw)
-            return d if isinstance(d, dict) else dict(DEFAULT)
+            out = json.loads(raw)
+            return out if isinstance(out, dict) else dict(DEFAULT)
         except Exception:
             return dict(DEFAULT)
 
     def _put(self, uid: int, data: dict) -> None:
-        self._diary(uid)._meta_set("affection",
+        self._diary(uid)._meta_set(self._key(uid),
                                    json.dumps(data, ensure_ascii=False))
 
     def set_note(self, uid: int, note: str) -> None:

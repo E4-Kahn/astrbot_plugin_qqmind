@@ -314,13 +314,19 @@
     "default": 100
   },
   "private_budget_tokens": {
-    "description": "私聊窗口 token 预算（溢出自动压成日记）",
+    "description": "记忆窗口 token 预算（私聊/群聊共用一条窗口，溢出自动压成日记）",
     "type": "int",
     "default": 10000,
     "hint": "感情陪伴型调大，省钱型调小"
   },
+  "private_group_glance_msgs": {
+    "description": "私聊时附带「群里最近在聊」的条数（0=关闭）",
+    "type": "int",
+    "default": 6,
+    "hint": "记忆合并后私聊能看到群聊语境；不想让私聊带出群话题就填 0"
+  },
   "diaries_dir": {
-    "description": "日记库目录（每用户一个 SQLite，默认相对本插件数据目录 plugin_data）",
+    "description": "记忆库目录（私聊+群聊共用一个 memory.db）",
     "type": "string",
     "default": "qqmind_diaries"
   },

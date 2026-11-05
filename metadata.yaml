@@ -14,10 +14,13 @@ desc: |
   判是才回复，创作/推理自动切思考模型。记忆支持平铺、浅层+群日记分层、
   按 QQ 号精确记忆线；三层日记标题+时间+标签+摘要，BM25 寻回，零 embedding。
   私聊：窗口按 token 预算管理，溢出自动压日记，「还记得吗」都能翻出来。
+  v0.4.0：私聊与群聊共用一条时间线与一个日记库（含私聊内容的篇目群里
+  只给概要不给原话）；压缩改为「先本地削窗口落摘录、再让模型升级成日记」，
+  连续失败熔断 30 分钟，窗口 token 单调下降，不再因模型抽风而无限增长。
 
   【人设】浅层状态 + 深层性格常驻，背景故事按篇章库管理（标题常驻、正文召回）。
   【护栏】每日预算熔断、每群频率上限、@全体忽略、bot 互怼拦截、主动私信多重护栏。
-version: 0.3.8
+version: 0.4.0
 author: 本少 (DanDingBenShao)
 social_link: https://space.bilibili.com/411821291
 repo: https://github.com/DanDingBenShao/astrbot_plugin_qqmind

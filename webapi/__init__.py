@@ -40,16 +40,21 @@ def route(path: str, methods: list[str], desc: str):
 
 @route("/stats", ["GET"], "qqmind 今日账本")
 async def api_stats(p):
-    diary_dir = p._abs_dir("diaries_dir", "qqmind_diaries")
+    # v0.4.0：私聊/群聊共用一个库（memory.db），总数直接问那个库
     diary_total = 0
     try:
-        for fn in os.listdir(diary_dir):
-            if fn.endswith(".db") and fn[:-3].isdigit():
-                diary_total += p._private(int(fn[:-3])).diary.count()
-    except OSError:
+        store = p._memory_store()
+        diary_total = store.count()
+        # 私聊篇数（gid==0 保守口径）/群聊篇数分开报，控制台更好看
+        priv_total = store.count(scope="private")
+        group_total = store.count(scope="group")
+    except Exception:      # noqa: BLE001
+        priv_total = group_total = 0
+    max_win = 0
+    try:
+        max_win = p._session().window_tokens()
+    except Exception:      # noqa: BLE001
         pass
-    max_win = max((x.window_tokens() for x in p.privates.values()),
-                  default=0)
     return {"status": "ok", "data": {
         "judged": p._STATS["judged"],
         "blocked": p._STATS["blocked"],
@@ -58,6 +63,8 @@ async def api_stats(p):
         "dropped_rate": p._STATS["dropped_rate"],
         "dropped_budget": p._STATS["dropped_budget"],
         "diary_total": diary_total,
+        "diary_private": priv_total,
+        "diary_group": group_total,
         "max_window_tokens": max_win,
         "budget": p._budget().snapshot()}}
 
@@ -161,7 +168,7 @@ def _launch_import(p, msgs: list[dict], uid: int, label: str) -> str:
                          budget=p.budget)
         if job.profile:
             try:
-                diary.save_profile(job.profile)
+                diary.save_profile(job.profile, uid=uid)
                 logger.info(f"[qqmind] import {import_id} "
                             f"profile saved for uid={uid}")
             except Exception as e:     # noqa: BLE001
@@ -296,53 +303,77 @@ async def api_affection_update(p):
 @route("/diaries", ["GET"], "qqmind 日记浏览")
 async def api_diaries(p):
     uid = str(_web_request.query.get("uid") or "").strip()
-    if uid:
-        uid_int = _safe_int_id(uid)
-        if uid_int <= 0:
-            return {"status": "ok", "data": {"entries": []}}
-        x = p._private(uid_int)
-    elif p.privates:
-        latest_uid = max(p.privates,
-                         key=lambda u: p.privates[u].diary.count())
-        x = p.privates[latest_uid]
-    else:
+    try:
+        store = p._memory_store()
+    except Exception:      # noqa: BLE001
         return {"status": "ok", "data": {"entries": []}}
-    rows = x.diary.recent_rows(10)
+    # v0.4.0：私聊/群聊共用一个库，这里直接给全库最近篇目；
+    # 每篇带 gid（0=含私聊内容，>0=纯群聊）供前端区分
+    rows = store.recent_rows(10)
     entries = [{
         "ts": time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"])),
         "title": (r["title"] or "").strip() or _short_title(r["summary"]),
         "tags": "、".join(json.loads(r["tags"])),
         "summary": r["summary"],
-        "content": (r["content"] or "").strip()} for r in rows]
+        "content": (r["content"] or "").strip(),
+        "gid": int(r["gid"] or 0),
+        "private": not int(r["gid"] or 0),
+        "uid": uid} for r in rows]
     return {"status": "ok", "data": {"entries": entries}}
 
 
 @route("/sessions", ["GET"], "qqmind 用户列表")
 async def api_sessions(p):
-    """有私聊日记的用户列表：扫磁盘日记库（不只内存里活跃的），
-    内存中有会话的补窗口 token。按日记数排序。"""
+    """用户列表（v0.4.0 合并记忆后）：uid 从窗口、好感度键与旧库文件三处汇总。
+
+    日记数改为「共享库总篇数」（一个库装所有人，已无法按 uid 归属），
+    每人的活跃度改看 `window_msgs`（该用户在窗口里的私聊消息数）。
+    """
     diary_dir = p._abs_dir("diaries_dir", "qqmind_diaries")
-    disk_uids = []
+    uids: set[int] = set(p.privates.keys())
+    sess = None
+    try:
+        sess = p._session()
+    except Exception:      # noqa: BLE001
+        sess = None
+    if sess is not None:
+        for m in sess.messages:
+            if m.get("src", "private") == "private" and int(m.get("uid") or 0):
+                uids.add(int(m["uid"]))
+    store = None
+    try:
+        store = p._memory_store()
+        for k in store.meta_keys("affinity:"):
+            try:
+                uids.add(int(k.split(":", 1)[1]))
+            except (IndexError, ValueError):
+                pass
+    except Exception:      # noqa: BLE001
+        store = None
+    # 兼容尚未迁移的旧库（<uid>.db）
     try:
         for fn in os.listdir(diary_dir):
             if fn.endswith(".db") and fn[:-3].isdigit():
-                disk_uids.append(int(fn[:-3]))
+                uids.add(int(fn[:-3]))
     except OSError:
         pass
+    total = store.count() if store is not None else 0
     users = []
-    for u in sorted(set(disk_uids) | set(p.privates.keys())):
-        x = p.privates.get(u)
-        n = x.diary.count() if x else p._private(u).diary.count()
+    for u in sorted(uids):
+        msgs = [m for m in (sess.messages if sess else [])
+                if m.get("src", "private") == "private"
+                and int(m.get("uid") or 0) == int(u)]
         aff = p._affection.get(u)
         users.append({
-            "uid": str(u), "diaries": n,
-            "window_tokens": x.window_tokens() if x else 0,
+            "uid": str(u), "diaries": total,
+            "window_msgs": len(msgs),
+            "window_tokens": (sess.window_tokens() if sess else 0),
             # QQ 头像直链（qlogo 公共 CDN，无需 API/无需下载中转）
             "avatar": f"https://q1.qlogo.cn/g?b=qq&nk={u}&s=100",
             "affinity": aff["score"],
             "note": aff.get("note", ""),
             "schedule": aff.get("schedule", "")})
-    users.sort(key=lambda x: -x["diaries"])
+    users.sort(key=lambda x: -x["window_msgs"])
     return {"status": "ok", "data": {"users": users}}
 
 

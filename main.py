@@ -109,6 +109,7 @@ _CONFIG_KEYS = (
     "persona_live_mode",
     "persona_packs_dir", "persona_headers_in_prompt", "persona_recall_top",
     "private_budget_tokens", "diary_headers_in_prompt", "diaries_dir",
+    "private_group_glance_msgs",
     "group_preset", "wake_keywords", "group_buffer_size",
     "read_mode", "random_min_seconds", "random_max_seconds", "roam_enabled",
     "debounce_seconds", "batch_max_messages",
@@ -163,7 +164,9 @@ class QQMindPlugin(JudgeGateMixin, MemoryInjectMixin, InteractionsMixin,
         self.privates: dict[int, PrivateSession] = {}
         self.memories: dict[int, GroupMemory] = {}
         self._pub_pool: CandidatePool | None = None   # 公共候选池（v0.3.0）
-        self._pub_diary = None                        # 公共群日记库（v0.3.0）
+        self._pub_diary = None                        # 统一记忆库（v0.4.0，memory.db）
+        self._mem_session = None                      # 统一记忆窗口（v0.4.0）
+        self._win_save_ts = 0.0                       # 窗口落盘节流（v0.4.0）
         self._flushing: dict[int, bool] = {}
         self.group_buffer = GroupBuffer(
             max_len=int(self._cfg("group_buffer_size", 60)),
@@ -265,6 +268,12 @@ class QQMindPlugin(JudgeGateMixin, MemoryInjectMixin, InteractionsMixin,
 
     # ---------- 存储 ----------
     def _group_mem(self, gid: int) -> GroupMemory:
+        """群记忆对象（v0.4.0 起只承担两件事：候选池合批压缩 + 群日记命令）。
+
+        平铺/精确窗口已并入统一 `_session()` 的公共时间线，`flat`/`precise`
+        不再写入；保留类与文件是为了 `compress_pool_call/compress_pool_batch`
+        和旧数据兼容（磁盘上的 `<gid>.json` 只读不写）。
+        """
         gid = int(gid)
         gm = self.memories.get(gid)
         if gm is None:
@@ -273,36 +282,84 @@ class QQMindPlugin(JudgeGateMixin, MemoryInjectMixin, InteractionsMixin,
                 flat_limit=int(self._cfg("group_flat_messages", 60)),
                 shallow_limit=int(self._cfg("group_shallow_messages", 20)),
                 precise_budget=int(self._cfg("precise_budget_tokens", 4000)),
-                diary=self._group_diary())
+                diary=self._memory_store())
             self.memories[gid] = gm
         return gm
 
-    def _group_diary(self):
-        """公共群日记库（v0.3.0）：所有群共用一个 SQLite（entries.gid 记来源群）。
+    def _memory_store(self):
+        """统一记忆库（v0.4.0）：私聊与群聊共用一个 SQLite（`memory.db`）。
 
-        首次创建时把旧的每群 <gid>.db 合并进来（改名 .migrated 备份）。
-        v0.3.1：group_diaries_dir 与 diaries_dir 相同时跳过迁移——否则会把
-        私聊 <uid>.db 当群库并进公共库（隐私事故）。
+        entries.gid == 0 表示含私聊内容（群聊侧只给概要、不给原话）；
+        entries.gid >  0 表示纯群聊，记来源群号。
+        首次创建时把 `diaries_dir/<uid>.db` 与 `group_diaries_dir/*.db`
+        全部并进来，原库改名 `.migrated` 备份（meta 记已并清单，幂等可重入）。
         """
         if self._pub_diary is None:
-            ddir = self._abs_dir("group_diaries_dir", "qqmind_group_diaries")
-            pdir = self._abs_dir("diaries_dir", "qqmind_diaries")
+            ddir = self._abs_dir("diaries_dir", "qqmind_diaries")
             from .core.diary import DiaryStore
-            store = DiaryStore(ddir, 0, name="group_public")
+            store = DiaryStore(ddir, 0, name="memory")
             try:
-                if os.path.abspath(ddir) == os.path.abspath(pdir):
-                    logger.warning(
-                        "[qqmind] group_diaries_dir == diaries_dir；"
-                        "跳过旧群库迁移以保护私聊日记")
-                else:
-                    n = DiaryStore.migrate_group_dbs(ddir, store)
-                    if n:
-                        logger.info(f"[qqmind] group diaries merged into public: "
-                                    f"{n} entries")
-            except Exception as e:
-                logger.warning(f"[qqmind] group diary migration failed: {e!r}")
+                n = self._migrate_memory_dbs(store)
+                if n:
+                    logger.info(f"[qqmind] memory merged into memory.db: "
+                                f"{n} entries")
+            except Exception as e:     # noqa: BLE001 迁移失败不许影响启动
+                logger.warning(f"[qqmind] memory migration failed: {e!r}")
             self._pub_diary = store
         return self._pub_diary
+
+    _MIGRATED = "migrated_memory_dbs"
+
+    def _migrate_memory_dbs(self, store) -> int:
+        """把旧库并进统一库：群库（<gid>.db / group_public.db）与私聊库（<uid>.db）。"""
+        from .core.diary import DiaryStore
+        ddir = Path(self._abs_dir("diaries_dir", "qqmind_diaries"))
+        gdir = Path(self._abs_dir("group_diaries_dir", "qqmind_group_diaries"))
+        done = set((store.get_meta(self._MIGRATED) or "").split(","))
+        done.discard("")
+        plan: list[tuple[Path, int, int]] = []     # (路径, 默认 gid, 归属 uid)
+        for d in {str(ddir.resolve()), str(gdir.resolve())}:
+            p = Path(d)
+            if not p.is_dir():
+                continue
+            for f in sorted(p.glob("*.db")):
+                if f.stem in ("memory", "group_public"):
+                    if f.stem == "group_public":
+                        plan.append((f, 0, 0))
+                    continue
+                if str(p.resolve()) == str(ddir.resolve()) and f.stem.isdigit():
+                    continue          # 私聊库，下面按 uid 单独处理
+                plan.append((f, int(f.stem) if f.stem.isdigit() else 0, 0))
+        if ddir.is_dir():
+            for f in sorted(ddir.glob("*.db")):
+                if f.stem.isdigit():
+                    plan.append((f, 0, int(f.stem)))
+        merged = 0
+        moved: list[str] = []
+        for f, gid, owner in plan:
+            key = str(f.resolve())
+            if key in done:
+                continue
+            try:
+                merged += DiaryStore.merge_db(f, store, default_gid=gid,
+                                              owner_uid=owner)
+                moved.append(key)
+            except Exception as e:     # noqa: BLE001
+                logger.warning(f"[qqmind] merge {f.name} failed: {e!r}")
+        if moved:
+            done.update(moved)
+            store.set_meta(self._MIGRATED, ",".join(sorted(done)))
+            for key in moved:
+                src = Path(key)
+                try:
+                    os.replace(src, src.with_suffix(src.suffix + ".migrated"))
+                except OSError:
+                    pass
+        return merged
+
+    def _group_diary(self):
+        """群日记库（兼容旧名）：v0.4.0 起就是统一记忆库 `_memory_store()`。"""
+        return self._memory_store()
 
     def _pool(self) -> CandidatePool:
         """公共候选池（v0.3.0）：所有群共用，消息自带 gid。
@@ -537,17 +594,26 @@ class QQMindPlugin(JudgeGateMixin, MemoryInjectMixin, InteractionsMixin,
         except Exception:
             return []
 
-    def _private(self, uid: int) -> PrivateSession:
+    def _session(self) -> PrivateSession:
+        """统一记忆窗口（v0.4.0）：私聊与群聊共用一条时间线、一起写日记。
+
+        窗口条目自带 `src`（private/group）、`gid`、`uid`、`nick`，
+        注入时按作用域切片（`context(scope=...)`），压缩时统一成一篇日记，
+        含私聊内容的篇目标 gid=0（群聊侧只给概要、不给原话）。
+        """
         budget = int(self._cfg("private_budget_tokens", 10000))
-        p = self.privates.get(uid)
-        if p is None:
-            p = PrivateSession(self._abs_dir("diaries_dir", "qqmind_diaries"), uid,
-                               budget=budget)
-            self.privates[uid] = p
-            self._ensure_proactive_loop()
+        if self._mem_session is None:
+            self._mem_session = PrivateSession(self._memory_store(), budget=budget)
         else:
-            p.budget = budget      # 控制台改预算热生效
-        return p
+            self._mem_session.budget = budget     # 控制台改预算热生效
+        return self._mem_session
+
+    def _private(self, uid: int) -> PrivateSession:
+        """兼容接口：老代码按 uid 取会话；合并后全部指向同一个 `_session()`。"""
+        s = self._session()
+        self.privates[int(uid)] = s
+        self._ensure_proactive_loop()
+        return s
 
     def _spawn(self, coro) -> asyncio.Task:
         """create_task 并持有强引用：事件循环只持弱引用，纯 fire-and-forget
@@ -962,39 +1028,40 @@ class QQMindPlugin(JudgeGateMixin, MemoryInjectMixin, InteractionsMixin,
         preset = normalize_preset(self._cfg("group_preset", "light"))
         if preset == "advanced":
             if self._cfg("precise_memory", False):
-                return "precise"
+                # v0.4.0：窗口合并后「每人一条精确记忆线」并入公共时间线，
+                # 精确记忆退化为平铺（配置保留，行为等同全量）
+                return "flat"
             return "layered" if self._cfg("memory_layering", True) else "flat"
-        return preset_memory_mode(preset) or "flat"
+        mode = preset_memory_mode(preset) or "flat"
+        return "flat" if mode == "precise" else mode
 
     def _is_light(self) -> bool:
         return normalize_preset(self._cfg("group_preset", "light")) == "light"
 
     def _group_contexts(self, gid: int, uid: int,
                         skip_last: int = 0) -> list[dict]:
-        """回复的逐字 contexts（档位定案 2026-11-01 拨乱反正）：
+        """回复的逐字 contexts（档位定案 2026-11-01；v0.4.0 改为公共窗口切片）：
 
-        - 精确记忆：该用户记忆线（与档位无关）
-        - 轻量：[]（轻量只回 @，语境靠 system tail 的 20 条）
-        - 全量：group_flat_messages 条（原定义：平铺不分层）
-        - 分层：group_shallow_messages 条浅层（原定义：浅层+深层日记）
-        - 高级：reply_context_messages 自选（高级=暴露轴，默认 0 省）
+        - 精确/全量：group_flat_messages 条
+        - 轻量：[]（语境靠 system tail 的 20 条速览）
+        - 分层：group_shallow_messages 条浅层
+        - 高级：reply_context_messages 自选（默认 0 省）
+        只取本群消息（合并窗口后按 gid 过滤），不会把别群的逐字带进来。
         """
         mode = self._memory_mode()
         preset = normalize_preset(self._cfg("group_preset", "light"))
-        if mode == "precise":
-            return self._group_mem(gid).precise_context(uid)
         if self._is_light():
             return []
         if preset == "advanced":
             limit = int(self._cfg("reply_context_messages", 0))
         else:
-            # 全量/分层按各自定义恢复；配置填 0 也可关
             limit = (int(self._cfg("group_flat_messages", 60))
                      if mode == "flat"
                      else int(self._cfg("group_shallow_messages", 20)))
         if limit <= 0:
             return []
-        return self._group_mem(gid).flat_context(limit, skip_last=skip_last)
+        return self._session().context(scope="group", gid=gid, limit=limit,
+                                       skip_last=skip_last)
 
     # ---------- 人设三层 + 背景故事 ----------
     def _persona_block(self) -> str:
@@ -1087,17 +1154,15 @@ class QQMindPlugin(JudgeGateMixin, MemoryInjectMixin, InteractionsMixin,
         if background:
             tail.append((1, background))
         mode = self._memory_mode()
-        if mode in ("layered", "precise"):
-            # 公共群记忆（v0.3.0）：所有群共用一个日记库，标题直接全量给
-            headers = self._group_mem(gid).diary_headers(
-                int(self._cfg("diary_headers_in_prompt", 8)))
+        if mode == "layered":
+            # 公共记忆（v0.4.0）：一个库装所有群 + 私聊，群聊视角只给标题行
+            headers = self._group_diary().headers_for_prompt(
+                int(self._cfg("diary_headers_in_prompt", 8)), scope="group")
             if headers:
                 tail.append((3, "你有群聊日记（所有群共同的记忆；时间 标题，"
                                  "想细看就输出 <查群日记\"关键词或时间\">）：\n"
                                  + headers))
-        if mode == "precise":
-            n_ctx = 10
-        elif self._is_light():
+        if self._is_light():
             n_ctx = int(self._cfg("group_context_messages", 20))
         else:
             n_ctx = 0
@@ -1158,87 +1223,82 @@ class QQMindPlugin(JudgeGateMixin, MemoryInjectMixin, InteractionsMixin,
                 pass
         return global_src
 
+    # ---------- 记忆写入（v0.4.0：私聊/群聊共用一条时间线） ----------
     def _record_incoming(self, gid: int, uid: int, nick: str, text: str) -> None:
-        """全量/分层模式把每条群消息记进平铺窗口（轻量不记，精确记忆只记互动）。
+        """群消息进公共窗口（轻量档不记；削窗口由 `_compress_memory` 统一做）。
 
-        分层模式（v0.2.14）：窗口挤出的消息进候选池攒批，池满才压缩——
-        替代旧的"每挤一批就压一次"（3213 碎片日记的根因）。
+        每个条目自带 src/gid/uid/nick：注入时按作用域切片，压缩时混成一篇
+        日记（含私聊内容的篇目记 gid=0，群聊侧只给概要）。
         """
         if not (text or "").strip() or self._is_light():
             return
-        mode = self._memory_mode()
-        if mode == "precise":
-            return
-        gm = self._group_mem(gid)
-        gm.add_group_message(uid, nick, text)
-        limit = (int(self._cfg("group_flat_messages", 60))
-                 if mode == "flat"
-                 else int(self._cfg("group_shallow_messages", 20)))
-        evicted = gm.take_flat_overflow(limit)
-        if evicted and mode == "layered":
-            pool = self._pool()
-            now = time.time()
-            for m in evicted:
-                pool.add(m.get("ts") or now, gid, m.get("uid") or 0,
-                         m.get("nick") or "", _strip_own_prefix(
-                             m.get("nick") or "", m.get("content") or ""))
-            pool.save()
-            if pool.should_flush():
-                self._spawn(self._flush_pool())
-        gm.save()
+        cap = int(self._cfg("max_msg_tokens", 100)) * 4
+        s = self._session()
+        s.append_user_message(text, cap_tokens=cap,
+                              src="group", gid=gid,
+                              uid=int(uid), nick=nick)
+        # 落盘节流（v0.4.0）：群消息多，每条都写整窗太贵；5 秒内至多一次，
+        # 崩溃最多丢 5 秒的窗口（旧版每条都写文件，但那时窗口只有 60 条）。
+        now = time.time()
+        if now - self._win_save_ts >= 5.0:
+            self._win_save_ts = now
+            try:
+                s.save_window()
+            except Exception as e:     # noqa: BLE001 落盘失败不许影响消息链
+                logger.warning(f"[qqmind] save window failed: {e!r}")
 
     def _persist_group(self, gid: int, uid: int,
                        messages: list[tuple[int, str, str]], reply: str) -> None:
-        """群回复落盘：按记忆模式平铺 / 压日记 / 进精确记忆线。"""
+        """群回复落盘：助手消息也进同一条时间线（用户消息在入口已记）。"""
         if self._is_light():
             return
-        mode = self._memory_mode()
-        gm = self._group_mem(gid)
-        if mode == "precise":
-            user_text = "\n".join(t for _, _, t in messages if t)
-            gm.add_precise_round(uid, user_text, reply)
-            over = gm.take_precise_overflow(uid)
-            if over:
-                self._spawn(
-                    self._compress_or_restore(gid, over, [str(uid)], uid))
-        else:
-            gm.add_assistant(reply)
-            limit = (int(self._cfg("group_flat_messages", 60))
-                     if mode == "flat"
-                     else int(self._cfg("group_shallow_messages", 20)))
-            evicted = gm.take_flat_overflow(limit)
-            if evicted and mode == "layered":
-                pool = self._pool()
-                now = time.time()
-                for m in evicted:
-                    pool.add(m.get("ts") or now, gid, m.get("uid") or 0,
-                             m.get("nick") or "", _strip_own_prefix(
-                                 m.get("nick") or "", m.get("content") or ""))
-                pool.save()
-                if pool.should_flush():
-                    self._spawn(self._flush_pool())
-        gm.save()
-
-    async def _compress_or_restore(self, gid: int, msgs: list[dict],
-                                   tags_extra=None, precise_uid=None) -> None:
-        """压进群日记；失败把原文放回窗口，下轮再试（不丢记忆）。"""
-        provider = await self._aux_provider("compress")
-        gm = self._group_mem(gid)
-        used = 0
-        if provider is not None:
-            used = await gm.compress_messages(provider, msgs, tags_extra)
-        if used:
-            self._budget().add(int(used), gid=int(gid))
-            logger.info(f"[qqmind] group diary entry for {gid}, "
-                        f"{len(msgs)} msgs")
+        if not (reply or "").strip():
             return
-        if precise_uid is not None:
-            gm.precise.setdefault(int(precise_uid), [])[:0] = msgs
-        else:
-            gm.flat[:0] = msgs
-        gm.save()
+        self._session().append_assistant(
+            reply, src="group", gid=int(gid),
+            nick=self._bot_names.get(int(gid)) or "AI")
+        try:
+            self._session().save_window()
+        except Exception as e:     # noqa: BLE001
+            logger.warning(f"[qqmind] save window failed: {e!r}")
 
-    # ---------- 挂点 1：事件监听（判读门） ----------
+    def _pool_evict_handler(self, msgs: list[dict]) -> bool:
+        """分层模式：窗口挤出的一整段群消息交给候选池攒批（池满才压一次）。
+
+        返回 True 表示这段已被池接管，不再生成摘录条目；混了私聊的段落
+        一律返回 False，走正常日记压缩（私聊原文不许进群池）。
+        """
+        if self._memory_mode() != "layered":
+            return False
+        if any(m.get("src", "private") != "group" for m in msgs):
+            return False
+        pool = self._pool()
+        now = time.time()
+        for m in msgs:
+            pool.add(m.get("ts") or now, int(m.get("gid") or 0),
+                     int(m.get("uid") or 0), m.get("nick") or "",
+                     _strip_own_prefix(m.get("nick") or "",
+                                       m.get("content") or ""))
+        pool.save()
+        if pool.should_flush():
+            self._spawn(self._flush_pool())
+        return True
+
+    async def _compress_memory(self, s=None) -> None:
+        """统一压缩入口（四层稳态）：本地削窗口 → 模型升级 → 熔断 → 碎片合并。
+
+        窗口 token 单调下降，**与模型可用性解耦**：模型挂了也只是多几条
+        摘录条目，不会像旧版那样「压不动就一直涨」。
+        """
+        s = s or self._session()
+        if s.on_evict is None:
+            s.on_evict = self._pool_evict_handler
+        stats = await s.ensure_budget(lambda: self._aux_provider("compress"))
+        if stats.get("used"):
+            self._budget().add(int(stats["used"]), gid=0)
+        if stats.get("slices") or stats.get("upgraded"):
+            logger.info(f"[qqmind] memory compress {stats}")
+
     # ---------- 挂点 1：事件监听（判读门） ----------
     # C2 解耦：实现体在 handlers/judge_gate.JudgeGateMixin（self 即本类实例）。
     # 装饰器必须留在本模块：AstrBot 按 handler.__module__ == 插件主模块过滤
@@ -1273,9 +1333,10 @@ class QQMindPlugin(JudgeGateMixin, MemoryInjectMixin, InteractionsMixin,
                 if t and not t.done():
                     t.cancel()
         self._runtime.clear()
-        for p in self.privates.values():
-            p.save_window()      # v0.3.2：卸载前把内存窗口落盘
-            p.diary.close()
+        # v0.4.0：私聊/群聊共用一条会话与一个库，只落盘/关闭一次
+        if self._mem_session is not None:
+            self._mem_session.save_window()
+            self._mem_session = None
         self.privates.clear()
         for gm in self.memories.values():
             gm.close()

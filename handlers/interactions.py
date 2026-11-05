@@ -148,16 +148,27 @@ class InteractionsMixin:
         except asyncio.CancelledError:
             pass
 
+    def _private_window(self, uid: int) -> list[dict]:
+        """合并窗口里属于该 uid 的私聊消息（v0.4.0：窗口私聊/群聊共用）。"""
+        try:
+            msgs = self._session().messages
+        except Exception:          # noqa: BLE001 兼容旧结构
+            p = self.privates.get(uid)
+            msgs = p.messages if p else []
+        return [m for m in msgs
+                if m.get("src", "private") == "private"
+                and int(m.get("uid") or 0) == int(uid)]
+
     async def _proactive_tick(self) -> None:
         # 未回应冷却（v0.3.5 接线）：主动消息发出 24h 没人理 → 记一次，
         # 攒满 no_reply_limit 次 → 该用户冷却 7 天。之前这逻辑只有
         # mark_no_reply 方法、没有调用方，护栏形同虚设。
         limit = int(self._cfg("proactive_no_reply_limit", 3))
         if limit > 0:
-            for uid, p in self.privates.items():
+            for uid in list(self.privates):
                 pro_ts = 0.0
                 user_ts = 0.0
-                for m in p.messages:
+                for m in self._private_window(uid):
                     if m.get("proactive"):
                         pro_ts = max(pro_ts, float(m.get("ts") or 0))
                     elif m.get("role") == "user":
@@ -169,8 +180,9 @@ class InteractionsMixin:
             # 好感度模式（v0.2.8）：候选=有私聊窗口的活跃用户 ∩ 好感度达标 ∩ 作息匹配
             threshold = int(self._cfg("affinity_threshold", 70))
             actives = []
-            for uid, p in self.privates.items():
-                if not p.messages:
+            for uid in list(self.privates):
+                msgs = self._private_window(uid)
+                if not msgs:
                     continue
                 aff = self._affection.get(uid)
                 if aff["score"] < threshold:
@@ -178,15 +190,18 @@ class InteractionsMixin:
                 if not in_schedule(aff.get("schedule", "")):
                     continue
                 actives.append((uid, max(
-                    (m.get("ts") or 0) for m in p.messages)))
+                    (m.get("ts") or 0) for m in msgs)))
         elif friends:
             # 旧白名单模式（兼容）：安静时段 ∩ 白名单
             actives = []
             for f in friends:
                 uid = int(f) if f.isdigit() else 0
-                if uid and uid in self.privates and self.privates[uid].messages:
+                if not uid or uid not in self.privates:
+                    continue
+                msgs = self._private_window(uid)
+                if msgs:
                     actives.append((uid, max(
-                        (m.get("ts") or 0) for m in self.privates[uid].messages)))
+                        (m.get("ts") or 0) for m in msgs)))
         else:
             return
         if not affinity_on and not in_quiet_hours(
@@ -205,7 +220,8 @@ class InteractionsMixin:
         if provider is None:
             return
         p = self.privates[uid]
-        digest = memory_digest(p.diary, p.messages)
+        history = self._private_window(uid)
+        digest = memory_digest(p.diary, history, scope="private")
         bot_name = self._persona_block().split("\n")[0][:12] or "AI"
         greeting = await build_greeting(provider, bot_name, str(uid), digest)
         if not greeting:
@@ -221,8 +237,8 @@ class InteractionsMixin:
             logger.warning(f"[qqmind] proactive send to {uid} failed: {e!r}")
             return
         self._proactive.mark_sent(uid)
-        p.messages.append({"role": "assistant", "content": greeting,
-                           "ts": time.time(), "proactive": True})
+        p.append_assistant(greeting, src="private", uid=int(uid),
+                           proactive=True)
         p.save_window()
         self._STATS["proactive_sent"] = self._STATS.get("proactive_sent", 0) + 1
         logger.info(f"[qqmind] proactive greeting -> {uid}: {greeting[:40]}")

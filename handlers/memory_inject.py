@@ -32,7 +32,7 @@ class MemoryInjectMixin:
         if event.is_private_chat():
             p = self._private(uid)
             q = (event.message_str or "").strip()
-            profile = self._private_system_prompt(p, q)
+            profile = self._private_system_prompt(p, q, uid=uid)
             # v0.3.2：记忆类提问先本地预检索（模型常忘记输出 <查日记> 标记）
             if q and _m_re()[3].search(q):
                 try:
@@ -104,24 +104,51 @@ class MemoryInjectMixin:
 
     def _diary_headers(self, p: PrivateSession) -> str:
         n = int(self._cfg("diary_headers_in_prompt", 10))
-        headers = p.diary.headers_for_prompt(n)
+        # v0.4.0 合并记忆：私聊视角能看到全部篇目（群聊日记 + 私聊日记），
+        # 群聊视角反过来只给纯群聊篇目（见 main._group_system_prompt）
+        headers = p.diary.headers_for_prompt(n, scope="any")
         if not headers:
             return ""
         return (f"你有关于这位用户的日记（时间 标题，想细看就输出 <查日记\"关键词或时间\">）：\n"
                 f"{headers}")
 
-    def _private_system_prompt(self, p: PrivateSession,
-                               query: str = "") -> str:
+    def _group_glance(self, p: PrivateSession) -> str:
+        """私聊 prompt 里的「群里最近发生了什么」速览（v0.4.0）。
+
+        只给最近几条群消息的摘要行，不含私聊内容；条数由
+        `private_group_glance_msgs` 控制（0 = 关闭）。
+        """
+        n = int(self._cfg("private_group_glance_msgs", 6))
+        if n <= 0:
+            return ""
+        try:
+            lines = p.recent_group_lines(n)
+        except Exception as e:      # noqa: BLE001
+            logger.debug(f"[qqmind] group glance failed: {e!r}")
+            return ""
+        if not lines:
+            return ""
+        return ("【群里最近在聊（供你了解语境，私聊里不用主动汇报）】\n"
+                + "\n".join(lines))
+
+    def _private_system_prompt(self, p: PrivateSession, query: str = "",
+                               uid: int = 0) -> str:
+        """私聊 system prompt 片段。
+
+        uid 必须传（v0.4.0）：记忆合并后 `p` 是所有人共用的一个会话，
+        `p.uid` 恒为 0，画像与好感度都得靠 event 的说话人 uid 定位。
+        """
+        uid = int(uid or p.uid or 0)
         parts = []
         persona = self._persona_block()
         if persona:
             parts.append(persona)
-        profile_line = p.diary.profile_prompt()
+        profile_line = p.diary.profile_prompt(uid)
         if profile_line:
             parts.append(profile_line)
         # 好感度备注/作息（v0.2.8）：只对开启者注入
         if self._cfg("affinity_enabled", False):
-            aff_line = profile_to_prompt(self._affection.get(p.uid))
+            aff_line = profile_to_prompt(self._affection.get(uid))
             if aff_line:
                 parts.append(aff_line)
         background = self._persona_background(query)
@@ -130,6 +157,9 @@ class MemoryInjectMixin:
         headers = self._diary_headers(p)
         if headers:
             parts.append(headers)
+        glance = self._group_glance(p)
+        if glance:
+            parts.append(glance)
         return "\n".join(parts)
 
     async def _recall_reply(self, reply: str, scope: str, uid: int,
@@ -155,16 +185,16 @@ class MemoryInjectMixin:
         query = m.group(1)
         if scope == "private":
             p = self._private(uid)
-            found = (p.diary.by_time(query) if parse_time_query(query)
-                     else p.diary.search(query))
+            # 私聊视角 = 全库（群聊日记也能查，主人自己的东西不设限）
+            found = (p.diary.by_time(query, scope="any") if parse_time_query(query)
+                     else p.diary.search(query, scope="any"))
             system = self._private_system_prompt(p)
-            contexts = [{"role": x["role"], "content": x["content"]}
-                        for x in p.messages]
+            contexts = p.context(scope="private")
         else:
-            gm = self._group_mem(gid)
-            store = self._group_diary()   # 公共库（v0.3.0）
-            found = (store.by_time(query) if parse_time_query(query)
-                     else store.search(query))
+            store = self._group_diary()   # 统一库（v0.4.0）
+            # 群聊视角 = 只有纯群聊篇目：含私聊内容的篇目（gid=0）不进群检索
+            found = (store.by_time(query, scope="group") if parse_time_query(query)
+                     else store.search(query, scope="group"))
             system = self._group_system_prompt(gid)
             contexts = self._group_contexts(gid, uid)
         if provider is None:
@@ -208,7 +238,8 @@ class MemoryInjectMixin:
                 if scope == "private":
                     detail = self._private(uid).diary.expand(eid)
                 else:
-                    detail = self._group_diary().expand(eid)
+                    # 群聊视角不许展开含私聊内容的篇目（v0.4.0 隐私边界）
+                    detail = self._group_diary().expand(eid, allow_private=False)
                 # 证据链（v0.3.0）：命中日记的 evidence 消息 id →
                 # 公共池原文 ±3 条一起给，概要之外的对话细节当场还原
                 raw_ctx = ""
@@ -321,13 +352,9 @@ class MemoryInjectMixin:
             cap = int(self._cfg("max_msg_tokens", 100)) * 4
             async with self._hist_lock:
                 if text:
-                    p.append_user_message(text, cap)   # 超长截断保存
-                p.messages.append({"role": "assistant", "content": reply,
-                                   "ts": time.time()})
+                    p.append_user_message(text, cap, src="private", uid=uid)
+                p.append_assistant(reply, src="private", uid=uid)
                 p.save_window()                        # v0.3.2：重启不失忆
-                need = p.over_budget()
-            if need:
-                self._spawn(self._compress_private(p))
         else:
             gid = _safe_int_id(event.get_group_id())
             key = (gid, uid)
@@ -343,18 +370,12 @@ class MemoryInjectMixin:
             if s:
                 s.rounds_left = int(self._cfg("followup_rounds", 3))
                 s.touch()
+        # 统一稳压（v0.4.0）：私聊/群聊共用一条窗口，超预算就在后台削+压
+        mem = self._session()
+        if mem.over_budget() and not mem.compressing:
+            self._spawn(self._compress_memory(mem))
 
     async def _compress_private(self, p: PrivateSession):
-        provider = await self._aux_provider("compress")
-        if provider is None:
-            return
-        for _ in range(3):
-            if not p.over_budget():
-                return
-            ok = await p.compress_oldest(provider)
-            if not ok:
-                return
-            self._budget().add(int(ok), gid=0)
-        logger.info(f"[qqmind] private compressed for {p.uid}, "
-                    f"window={p.window_tokens()}/{p.budget} tok")
+        """兼容旧名：统一压缩入口（v0.4.0 起私聊/群聊共用一个窗口）。"""
+        await self._compress_memory(p)
 

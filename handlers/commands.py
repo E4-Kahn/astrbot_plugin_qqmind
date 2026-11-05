@@ -118,11 +118,11 @@ class CommandsMixin:
             yield event.plain_result(p.diary.expand(int(arg[1:])))
             return
         if not arg or arg in ("最近", "列表"):
-            out = p.diary.recent(5)
+            out = p.diary.recent(5, scope="any")
         elif parse_time_query(arg):
-            out = p.diary.by_time(arg)
+            out = p.diary.by_time(arg, scope="any")
         else:
-            out = p.diary.search(arg)
+            out = p.diary.search(arg, scope="any")
         out += "\n（看某篇原话：/日记 #编号）"
         yield event.plain_result(out)
 
@@ -138,16 +138,18 @@ class CommandsMixin:
         if allowed and str(gid) not in [str(g) for g in allowed]:
             yield event.plain_result("这个群没有开通我的记忆功能～")
             return
-        gm = self._group_mem(gid)
+        store = self._group_diary()
         arg = (event.message_str or "").strip()
         if arg.startswith("#") and arg[1:].isdigit():
-            yield event.plain_result(gm.diary.expand(int(arg[1:])))
+            yield event.plain_result(
+                store.expand(int(arg[1:]), allow_private=False))
             return
         if not arg or arg in ("最近", "列表"):
-            out = gm.diary.recent(5)
+            out = store.recent(5, scope="group")
         elif parse_time_query(arg):
-            out = gm.diary.by_time(arg)
+            out = store.by_time(arg, scope="group")
         else:
-            out = gm.diary.search(arg)
-        out += "\n（▷=存有原话，看原话发：/群日记 #编号；日记全群共用）"
+            out = store.search(arg, scope="group")
+        out += "\n（▷=存有原话，看原话发：/群日记 #编号；日记全群共用，"
+        out += "含私聊内容的篇目群里只给概要）"
         yield event.plain_result(out)

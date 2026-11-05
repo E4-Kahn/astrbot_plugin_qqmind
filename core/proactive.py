@@ -142,14 +142,24 @@ async def build_greeting(provider, bot_name: str, who: str,
         return ""
 
 
-def memory_digest(diary, window_tail: list[dict], n_topics: int = 3) -> str:
-    """触发时的记忆喂料：最近日记概要 + 窗口尾部对话。"""
+def memory_digest(diary, window_tail: list[dict], n_topics: int = 3,
+                  scope: str = "private") -> str:
+    """触发时的记忆喂料：最近日记概要 + 窗口尾部对话。
+
+    scope（v0.4.0 合并记忆）：默认只取私聊相关篇目——群聊内容不许被塞进
+    主动私信（主人私下收到的问候不该带出群里的对话）。
+    """
     parts = []
     if window_tail:
         lines = [f"{'用户' if m['role'] == 'user' else 'AI'}：{m['content']}"
                  for m in window_tail[-6:]]
         parts.append("最近聊过：\n" + "\n".join(lines))
-    d = diary.search("", n_topics) if hasattr(diary, "search") else ""
+    d = ""
+    if hasattr(diary, "search"):
+        try:
+            d = diary.search("", n_topics, scope=scope)
+        except TypeError:
+            d = diary.search("", n_topics)
     if d and "没有找到日记" not in d:
         parts.append("日记里的旧事：\n" + d)
     return "\n\n".join(parts)
